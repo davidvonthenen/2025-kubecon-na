@@ -1,6 +1,6 @@
 PYTHON ?= python
-# QUESTION ?= Provide guidance on what administrators should do when creating pods in a Kubernetes cluster.
-QUESTION ?= What is the current time?
+QUESTION ?= Provide guidance on what administrators should do when creating pods in a Kubernetes cluster.
+# QUESTION ?= What is the current time?
 
 .PHONY: ingest mcp mcp-server server agent client
 
