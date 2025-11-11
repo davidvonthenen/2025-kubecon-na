@@ -97,6 +97,7 @@ class MCPTimeServer:
 
         # External tool config
         self.k8sgpt_bin = os.getenv("K8SGPT_BIN", "k8sgpt")
+        self.use_fake_k8sgpt = os.getenv("K8SGPT_FAKE_MODE", "").lower() in {"1", "true", "yes"}
 
     # ---------- Built-in tool handlers ----------
 
@@ -123,6 +124,11 @@ class MCPTimeServer:
 
     async def _run_k8sgpt(self, args: List[str], timeout: int) -> Dict[str, Any]:
         """Execute k8sgpt and return (rc, stdout, stderr)."""
+        if self.use_fake_k8sgpt:
+            logger.info("K8SGPT_FAKE_MODE enabled; returning canned response instead of executing %s", self.k8sgpt_bin)
+            fake_payload = self._fake_k8sgpt_payload(args)
+            return {"rc": 0, "out": json.dumps(fake_payload), "err": ""}
+
         cmd = [self.k8sgpt_bin] + args
         logger.info("Executing: %s", " ".join(cmd))
         try:
@@ -218,6 +224,9 @@ class MCPTimeServer:
             logger.error(msg)
             return {"content": [{"type": "text", "text": msg}]}
 
+        if res["out"]:
+            logger.info("k8sgpt JSON output: %s", res["out"])
+
         try:
             payload = json.loads(res["out"])
         except json.JSONDecodeError:
@@ -247,6 +256,22 @@ class MCPTimeServer:
             lines.append(out_text)
 
         return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+    @staticmethod
+    def _fake_k8sgpt_payload(args: List[str]) -> Dict[str, Any]:
+        """Return a canned k8sgpt response used when fake mode is enabled."""
+        return {
+            "command": {
+                "executable": "k8sgpt",
+                "arguments": args,
+            },
+            "results": [],
+            "summary": {
+                "status": "PASS",
+                "message": "No privilege escalation findings (fake response)",
+            },
+            "generated_at": datetime.now().isoformat(),
+        }
 
     # ---------- MCP plumbing ----------
 
@@ -363,6 +388,7 @@ def main():
     logger.info("Health check: http://%s:%d/health", args.host, args.port)
     logger.info("Server info: http://%s:%d/info", args.host, args.port)
     logger.info("K8SGPT_BIN: %s", mcp_server.k8sgpt_bin)
+    logger.info("K8SGPT_FAKE_MODE: %s", mcp_server.use_fake_k8sgpt)
 
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())
 
