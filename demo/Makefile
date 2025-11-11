@@ -1,6 +1,7 @@
 PYTHON ?= python
-QUESTION ?= Provide guidance on what administrators should do when creating pods in a Kubernetes cluster.
+# QUESTION ?= Provide guidance on what administrators should do when creating pods in a Kubernetes cluster.
 # QUESTION ?= What is the current time?
+QUESTION ?= Using the MCP k8sgpt endpoint, analyze the cluster and report any workloads where securityContext.allowPrivilegeEscalation is true or unset. Return a compact list of offending objects (namespace/kind/name), the detected condition, and a one-line remediation (set allowPrivilegeEscalation=false and run workloads as non-root). Conclude PASS if none found; otherwise FAIL.
 
 .PHONY: ingest mcp mcp-server server agent client
 

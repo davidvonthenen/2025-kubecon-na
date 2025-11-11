@@ -1,21 +1,20 @@
 """
 MCP Server using Server-Sent Events (SSE)
-Provides a single tool to return the current time.
+Adds a k8sgpt-backed tool to analyze Pod security for allowPrivilegeEscalation.
 """
-
+import os
+import re
 import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict, Optional
-from dataclasses import dataclass, asdict
-
+from typing import Any, Dict, Optional, List
+from dataclasses import dataclass
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import StreamingResponse, JSONResponse
 from starlette.routing import Route
 import uvicorn
-
 
 # Configure logging
 logging.basicConfig(
@@ -23,7 +22,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
 
 @dataclass
 class MCPMessage:
@@ -37,18 +35,15 @@ class MCPMessage:
 
 
 class MCPTimeServer:
-    """MCP Server that provides current time functionality."""
-    
+    """MCP Server that provides time and k8sgpt-backed analysis."""
     def __init__(self):
         self.server_info = {
-            "name": "time-server",
-            "version": "1.0.0"
+            "name": "tool-server",
+            "version": "1.1.0"
         }
-        
-        self.capabilities = {
-            "tools": {}
-        }
-        
+        self.capabilities = {"tools": {}}
+
+        # Tool catalog
         self.tools = [
             {
                 "name": "get_current_time",
@@ -58,55 +53,57 @@ class MCPTimeServer:
                     "properties": {
                         "timezone": {
                             "type": "string",
-                            "description": "Timezone (e.g., 'UTC', 'America/New_York'). Defaults to system local time.",
+                            "description": "Timezone label to attach in output",
                             "default": "local"
                         },
                         "format": {
                             "type": "string",
-                            "description": "Output format: 'iso', 'unix', 'human'. Defaults to 'iso'.",
+                            "description": "Output: 'iso', 'unix', or 'human'",
                             "enum": ["iso", "unix", "human"],
                             "default": "iso"
                         }
                     }
                 }
+            },
+            {
+                "name": "k8sgpt_analyze_pod_security",
+                "description": "Runs `k8sgpt analyze --filter=Pod --explain --output=json` and reports workloads with allowPrivilegeEscalation=true or unset.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "namespace": {
+                            "type": "string",
+                            "description": "Optional namespace to scope analysis"
+                        },
+                        "no_cache": {
+                            "type": "boolean",
+                            "description": "Set to true to bypass k8sgpt cache",
+                            "default": False
+                        },
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "description": "Process timeout for k8sgpt command",
+                            "default": 60
+                        },
+                        "raw": {
+                            "type": "boolean",
+                            "description": "Include raw k8sgpt JSON in output text",
+                            "default": False
+                        }
+                    }
+                }
             }
         ]
-    
-    def handle_initialize(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle initialize request."""
-        logger.info(f"Initialize request from client: {params.get('clientInfo', {})}")
-        
-        return {
-            "protocolVersion": "2024-11-05",
-            "capabilities": self.capabilities,
-            "serverInfo": self.server_info
-        }
-    
-    def handle_list_tools(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle tools/list request."""
-        logger.info("Listing available tools")
-        return {"tools": self.tools}
-    
-    def handle_call_tool(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle tools/call request."""
-        tool_name = params.get("name")
-        arguments = params.get("arguments", {})
-        
-        logger.info(f"Tool called: {tool_name} with arguments: {arguments}")
-        
-        if tool_name == "get_current_time":
-            return self._get_current_time(arguments)
-        else:
-            raise ValueError(f"Unknown tool: {tool_name}")
-    
+
+        # External tool config
+        self.k8sgpt_bin = os.getenv("K8SGPT_BIN", "k8sgpt")
+
+    # ---------- Built-in tool handlers ----------
+
     def _get_current_time(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Get current time in specified format."""
-        timezone = arguments.get("timezone", "local")
+        tz = arguments.get("timezone", "local")
         format_type = arguments.get("format", "iso")
-        
         now = datetime.now()
-        
-        # Format the time based on requested format
         if format_type == "iso":
             time_str = now.isoformat()
         elif format_type == "unix":
@@ -115,135 +112,233 @@ class MCPTimeServer:
             time_str = now.strftime("%A, %B %d, %Y at %I:%M:%S %p")
         else:
             time_str = now.isoformat()
-        
-        result = {
+
+        return {
             "content": [
-                {
-                    "type": "text",
-                    "text": f"Current time ({timezone}): {time_str}"
-                }
+                {"type": "text", "text": f"Current time ({tz}): {time_str}"}
             ]
         }
-        
-        logger.info(f"Returning time: {time_str}")
-        return result
-    
+
+    # ---------- k8sgpt integration ----------
+
+    async def _run_k8sgpt(self, args: List[str], timeout: int) -> Dict[str, Any]:
+        """Execute k8sgpt and return (rc, stdout, stderr)."""
+        cmd = [self.k8sgpt_bin] + args
+        logger.info("Executing: %s", " ".join(cmd))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                return {"rc": -1, "out": "", "err": f"timeout after {timeout}s"}
+            return {"rc": proc.returncode, "out": stdout_b.decode("utf-8", "replace"), "err": stderr_b.decode("utf-8", "replace")}
+        except FileNotFoundError:
+            return {"rc": -2, "out": "", "err": f"k8sgpt binary not found: {self.k8sgpt_bin}"}
+        except Exception as e:
+            return {"rc": -3, "out": "", "err": str(e)}
+
+    @staticmethod
+    def _summarize_allow_priv_escalation(k8sgpt_json: Any) -> Dict[str, Any]:
+        """
+        Heuristic: scan k8sgpt findings for mentions of allowPrivilegeEscalation
+        being enabled or missing. Returns dict with pass_fail and offenders.
+        """
+        offenders = []
+        text_fields = []
+
+        def flatten_text(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if isinstance(v, (dict, list)):
+                        flatten_text(v)
+                    else:
+                        if isinstance(v, str):
+                            text_fields.append(v)
+            elif isinstance(obj, list):
+                for it in obj:
+                    flatten_text(it)
+
+        flatten_text(k8sgpt_json)
+        pattern = re.compile(r"allowPrivilegeEscalation", re.IGNORECASE)
+
+        # try to also capture object identity from common fields
+        def extract_identity(item: Dict[str, Any]) -> Optional[str]:
+            ns = item.get("namespace") or item.get("Namespace") or item.get("ns")
+            kind = item.get("kind") or item.get("Kind")
+            name = item.get("name") or item.get("Name")
+            if ns and kind and name:
+                return f"{ns}/{kind}/{name}"
+            return None
+
+        # Raw items may be under "results", "issues" or similar keys
+        items: List[Dict[str, Any]] = []
+        if isinstance(k8sgpt_json, dict):
+            for key in ("results", "issues", "items", "findings"):
+                v = k8sgpt_json.get(key)
+                if isinstance(v, list):
+                    items.extend([x for x in v if isinstance(x, dict)])
+
+        for it in items:
+            it_text = json.dumps(it, ensure_ascii=False)
+            if pattern.search(it_text):
+                ident = extract_identity(it) or "unknown/unknown/unknown"
+                offenders.append(ident)
+
+        # if we didn't find structured items, fall back to any text mention
+        if not offenders and any(pattern.search(t) for t in text_fields):
+            offenders.append("unresolved-identifiers")
+
+        status = "PASS" if not offenders else "FAIL"
+        return {"status": status, "offenders": offenders}
+
+    async def _k8sgpt_analyze_pod_security(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Run `k8sgpt analyze --filter=Pod --explain --output=json`
+        Optionally add --namespace, --no-cache.
+        """
+        namespace = arguments.get("namespace")
+        no_cache = bool(arguments.get("no_cache", False))
+        timeout_s = int(arguments.get("timeout_seconds", 60))
+        include_raw = bool(arguments.get("raw", False))
+
+        args = ["analyze", "--filter=Pod", "--explain", "--output=json"]
+        if namespace:
+            args += ["--namespace", namespace]
+        if no_cache:
+            args.append("--no-cache")
+
+        res = await self._run_k8sgpt(args, timeout=timeout_s)
+        if res["rc"] != 0:
+            msg = f"k8sgpt failed (rc={res['rc']}): {res['err']}".strip()
+            logger.error(msg)
+            return {"content": [{"type": "text", "text": msg}]}
+
+        try:
+            payload = json.loads(res["out"])
+        except json.JSONDecodeError:
+            # Some builds print extra header lines; try to extract JSON object
+            logger.warning("k8sgpt output not pure JSON; returning raw text")
+            summary = {"status": "UNKNOWN", "offenders": []}
+            out_text = res["out"]
+        else:
+            summary = self._summarize_allow_priv_escalation(payload)
+            out_text = json.dumps(payload, indent=2)
+
+        # Compose final response text
+        lines = [
+            "Control: containers must not allow privilege escalation (allowPrivilegeEscalation=false)",
+            f"Status: {summary['status']}",
+        ]
+        if summary["offenders"]:
+            lines.append("Offending objects:")
+            for ident in summary["offenders"]:
+                lines.append(f"  - {ident}")
+        else:
+            lines.append("No offending objects found by k8sgpt.")
+
+        if include_raw:
+            lines.append("")
+            lines.append("Raw k8sgpt JSON:")
+            lines.append(out_text)
+
+        return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+    # ---------- MCP plumbing ----------
+
+    def handle_initialize(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        logger.info("Initialize request from client: %s", params.get('clientInfo', {}))
+        return {
+            "protocolVersion": "2024-11-05",
+            "capabilities": self.capabilities,
+            "serverInfo": self.server_info
+        }
+
+    def handle_list_tools(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        logger.info("Listing available tools")
+        return {"tools": self.tools}
+
+    async def handle_call_tool(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+        logger.info("Tool called: %s args=%s", tool_name, arguments)
+
+        if tool_name == "get_current_time":
+            return self._get_current_time(arguments)
+
+        if tool_name == "k8sgpt_analyze_pod_security":
+            return await self._k8sgpt_analyze_pod_security(arguments)
+
+        raise ValueError(f"Unknown tool: {tool_name}")
+
     async def handle_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
         """Process incoming MCP message and return response."""
         try:
             method = message.get("method")
             params = message.get("params", {})
             msg_id = message.get("id")
-            
-            logger.info(f"Handling method: {method}")
-            
-            # Route to appropriate handler
+
             if method == "initialize":
                 result = self.handle_initialize(params)
             elif method == "tools/list":
                 result = self.handle_list_tools(params)
             elif method == "tools/call":
-                result = self.handle_call_tool(params)
+                result = await self.handle_call_tool(params)
             else:
                 raise ValueError(f"Unknown method: {method}")
-            
-            # Build response
-            response = {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": result
-            }
-            
-            return response
-            
+
+            return {"jsonrpc": "2.0", "id": msg_id, "result": result}
         except Exception as e:
-            logger.error(f"Error handling message: {e}", exc_info=True)
-            return {
-                "jsonrpc": "2.0",
-                "id": message.get("id"),
-                "error": {
-                    "code": -32603,
-                    "message": str(e)
-                }
-            }
+            logger.error("Error handling message: %s", e, exc_info=True)
+            return {"jsonrpc": "2.0", "id": message.get("id"), "error": {"code": -32603, "message": str(e)}}
 
 
 # Global server instance
 mcp_server = MCPTimeServer()
 
-
 async def sse_endpoint(request: Request) -> StreamingResponse:
-    """
-    SSE endpoint for MCP protocol.
-    Handles bidirectional JSON-RPC communication over SSE.
-    """
-    
+    """SSE endpoint for MCP protocol."""
     async def event_stream():
-        """Generate SSE events."""
         try:
-            # Read the request body (client's messages)
             body = await request.body()
-            
             if body:
-                # Parse incoming message
                 try:
                     message = json.loads(body.decode('utf-8'))
-                    logger.info(f"Received message: {json.dumps(message, indent=2)}")
-                    
-                    # Process message
+                    logger.info("Received message: %s", json.dumps(message, indent=2))
                     response = await mcp_server.handle_message(message)
-                    
-                    # Send response as SSE event
-                    event_data = json.dumps(response)
-                    yield f"data: {event_data}\n\n"
-                    
-                except json.JSONDecodeError as e:
-                    logger.error(f"Invalid JSON: {e}")
-                    error_response = {
-                        "jsonrpc": "2.0",
-                        "error": {
-                            "code": -32700,
-                            "message": "Parse error"
-                        }
-                    }
+                    yield f"data: {json.dumps(response)}\n\n"
+                except json.JSONDecodeError:
+                    error_response = {"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}
                     yield f"data: {json.dumps(error_response)}\n\n"
-            
-            # Keep connection alive
             await asyncio.sleep(0.1)
-            
         except Exception as e:
-            logger.error(f"Error in event stream: {e}", exc_info=True)
-    
+            logger.error("Error in event stream: %s", e, exc_info=True)
+
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
     )
 
-
 async def health_check(request: Request) -> JSONResponse:
-    """Health check endpoint."""
     return JSONResponse({
         "status": "healthy",
         "server": mcp_server.server_info,
         "timestamp": datetime.now().isoformat()
     })
 
-
 async def server_info(request: Request) -> JSONResponse:
-    """Return server information."""
     return JSONResponse({
         "serverInfo": mcp_server.server_info,
         "capabilities": mcp_server.capabilities,
         "tools": mcp_server.tools
     })
 
-
-# Create Starlette application
+# Starlette app
 app = Starlette(
     debug=True,
     routes=[
@@ -253,50 +348,23 @@ app = Starlette(
     ]
 )
 
-
 def main():
     """Run the MCP server."""
     import argparse
-    
-    parser = argparse.ArgumentParser(
-        description='MCP Time Server using SSE'
-    )
-    parser.add_argument(
-        '--host',
-        default='127.0.0.1',
-        help='Host to bind to (default: 127.0.0.1)'
-    )
-    parser.add_argument(
-        '--port',
-        type=int,
-        default=8080,
-        help='Port to bind to (default: 8080)'
-    )
-    parser.add_argument(
-        '--log-level',
-        default='INFO',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-        help='Log level (default: INFO)'
-    )
-    
+    parser = argparse.ArgumentParser(description='MCP Server with k8sgpt integration')
+    parser.add_argument('--host', default='127.0.0.1', help='Bind host')
+    parser.add_argument('--port', type=int, default=8080, help='Bind port')
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = parser.parse_args()
-    
-    # Update log level
-    logging.getLogger().setLevel(getattr(logging, args.log_level))
-    
-    logger.info(f"Starting MCP Time Server on {args.host}:{args.port}")
-    logger.info(f"SSE endpoint: http://{args.host}:{args.port}/sse")
-    logger.info(f"Health check: http://{args.host}:{args.port}/health")
-    logger.info(f"Server info: http://{args.host}:{args.port}/info")
-    
-    # Run server
-    uvicorn.run(
-        app,
-        host=args.host,
-        port=args.port,
-        log_level=args.log_level.lower()
-    )
 
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+    logger.info("Starting MCP Server on %s:%d", args.host, args.port)
+    logger.info("SSE endpoint: http://%s:%d/sse", args.host, args.port)
+    logger.info("Health check: http://%s:%d/health", args.host, args.port)
+    logger.info("Server info: http://%s:%d/info", args.host, args.port)
+    logger.info("K8SGPT_BIN: %s", mcp_server.k8sgpt_bin)
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())
 
 if __name__ == '__main__':
     main()
