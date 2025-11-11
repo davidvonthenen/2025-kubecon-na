@@ -19,14 +19,36 @@ The codebase includes three runnable services:
 * **API keys**
   * `VOYAGE_API_KEY` for embedding generation
   * `ANTHROPIC_API_KEY` for Claude message completions
+* A Kubernetes cluster in the cloud, on your laptop (using something like minikube), etc
 * (Optional) set `MCP_BASE_URL`, `VECTOR_STORE_DIR`, or `CLAUDE_MODEL` to override defaults used by the API server.
+
+## Configure 
+
+Please visit the [k8sgpt documentation](https://github.com/k8sgpt-ai/k8sgpt) for configuration instructions.
+
+## (Optional) Using Minikube
+
+If you do't have a Kubernetes cluster already... Start a cluster and deploy a pod:
+
+```bash
+# start a cluster
+minikube start
+
+# export the kubeconfig
+kubectl config use-context minikube
+
+# create a simple pod
+kubectl apply -f echoserver-pod.yaml
+
+# verify
+kubectl get pods
+```
 
 ## Installation
 
+Highly recommended to use a virtual environment something like `venv` or `conda`.
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
@@ -42,8 +64,8 @@ file.
 Run the ingestion pipeline after exporting your Voyage API key:
 
 ```bash
-export VOYAGE_API_KEY="sk_your_voyage_key"
-python -m src.ingest.ingest --docs-dir ./docs --db-dir ./chroma_db
+export VOYAGE_API_KEY="<YOUR API KEY>"
+make ingest
 ```
 
 The script reports how many files and chunks were processed and persists the resulting embeddings to
@@ -55,7 +77,7 @@ The REST agent can call MCP tools for supplementary data (currently a `get_curre
 Launch the Starlette-based server in a separate terminal:
 
 ```bash
-python -m src.mcp.server
+make mcp
 ```
 
 By default the server listens on `http://127.0.0.1:8080`, exposes a `/sse` endpoint for JSON-RPC
@@ -67,9 +89,9 @@ With embeddings in place, start the FastAPI service. Export both API keys and op
 vector store location or MCP endpoint:
 
 ```bash
-export ANTHROPIC_API_KEY="sk_your_anthropic_key"
-export VOYAGE_API_KEY="sk_your_voyage_key"
-python -m src.agent.server --host 0.0.0.0 --port 8000 --vector-store-dir ./chroma_db
+export ANTHROPIC_API_KEY="<YOUR API KEY>"
+export VOYAGE_API_KEY="<YOUR API KEY>"
+make server
 ```
 
 On startup the service loads the Chroma collection, connects to the MCP server to list tools, and then
@@ -85,58 +107,14 @@ serves the following endpoints:
 
 Interactive API docs are automatically available at `http://<host>:<port>/docs` when the server is running.
 
-### Example Query (non-streaming)
-
-```bash
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-        "question": "Summarize the architecture of this project",
-        "max_results": 4,
-        "use_mcp_tools": true
-      }'
-```
-
-### Example Streaming Query
-
-```bash
-curl -X POST http://localhost:8000/query/stream \
-  -H "Content-Type: application/json" \
-  -d '{
-        "question": "What time is it and how does the RAG flow work?",
-        "stream": true,
-        "use_mcp_tools": true
-      }'
-```
-
-Each line in the response is a JSON object that can be parsed incrementally.
-
 ## Use the Terminal Client
 
 The Rich-based CLI wraps the REST endpoints and provides interactive, single-shot, and streaming
 modes:
 
 ```bash
-python -m src.client.client --url http://localhost:8000 --query "How do I refresh the index?"
-```
-
-Key flags:
-
-* `--stream` – stream the answer in real time.
-* `--health` – display the `/health` response and exit.
-* `--sources` – list indexed documents.
-* `--tools` – show MCP tools currently available to the agent.
-* Omitting `--query` launches an interactive prompt that maintains conversation history with the API.
-
-## Makefile Shortcuts
-
-Common commands are packaged as make targets once your environment is active:
-
-```bash
-make ingest       # python -m src.ingest.ingest
-make mcp-server   # python -m src.mcp.server
-make server       # python -m src.agent.server
-make client       # python -m src.client.client --query "$(QUESTION)"
+# the QUESTION is contained at the top of the Makefile
+make client
 ```
 
 ## Project Structure
