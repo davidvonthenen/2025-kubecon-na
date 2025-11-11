@@ -97,6 +97,7 @@ class MCPTimeServer:
 
         # External tool config
         self.k8sgpt_bin = os.getenv("K8SGPT_BIN", "k8sgpt")
+        self.kubectl_bin = os.getenv("KUBECTL_BIN", "kubectl")
         self.use_fake_k8sgpt = os.getenv("K8SGPT_FAKE_MODE", "").lower() in {"1", "true", "yes"}
 
     # ---------- Built-in tool handlers ----------
@@ -202,6 +203,110 @@ class MCPTimeServer:
         status = "PASS" if not offenders else "FAIL"
         return {"status": status, "offenders": offenders}
 
+    async def _run_kubectl(self, args: List[str], timeout: int) -> Dict[str, Any]:
+        """Execute kubectl and return (rc, stdout, stderr)."""
+        cmd = [self.kubectl_bin] + args
+        logger.info("Executing: %s", " ".join(cmd))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                return {"rc": -1, "out": "", "err": f"timeout after {timeout}s"}
+            return {
+                "rc": proc.returncode,
+                "out": stdout_b.decode("utf-8", "replace"),
+                "err": stderr_b.decode("utf-8", "replace")
+            }
+        except FileNotFoundError:
+            return {"rc": -2, "out": "", "err": f"kubectl binary not found: {self.kubectl_bin}"}
+        except Exception as e:  # pragma: no cover - defensive catch-all
+            return {"rc": -3, "out": "", "err": str(e)}
+
+    async def _kubectl_privilege_escalation_report(
+        self, namespace: Optional[str], timeout: int
+    ) -> Dict[str, Any]:
+        """Return a k8sgpt-style JSON payload highlighting allowPrivilegeEscalation findings."""
+        args = ["get", "pods", "-o", "json"]
+        if namespace:
+            args.extend(["-n", namespace])
+        else:
+            args.append("--all-namespaces")
+
+        res = await self._run_kubectl(args, timeout=timeout)
+        if res["rc"] != 0:
+            logger.error("kubectl failed (rc=%s): %s", res["rc"], res["err"])
+            return {
+                "provider": "openai",
+                "errors": [{"message": res["err"] or "kubectl invocation failed", "rc": res["rc"]}],
+                "status": "ERROR",
+                "problems": 1,
+                "results": None,
+            }
+
+        try:
+            payload = json.loads(res["out"])
+        except json.JSONDecodeError:
+            logger.error("kubectl JSON decode failed")
+            return {
+                "provider": "openai",
+                "errors": [{"message": "kubectl output was not valid JSON"}],
+                "status": "ERROR",
+                "problems": 1,
+                "results": None,
+            }
+
+        offenders: List[Dict[str, Any]] = []
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            metadata = item.get("metadata", {}) or {}
+            spec = item.get("spec", {}) or {}
+            namespace_name = metadata.get("namespace", "default")
+            pod_name = metadata.get("name", "unknown")
+            container_specs: List[Dict[str, Any]] = []
+            for key in ("containers", "initContainers", "ephemeralContainers"):
+                value = spec.get(key)
+                if isinstance(value, list):
+                    container_specs.extend([c for c in value if isinstance(c, dict)])
+
+            for container_spec in container_specs:
+                container_name = container_spec.get("name", "unnamed")
+                security_context = container_spec.get("securityContext") or {}
+                allow_priv = security_context.get("allowPrivilegeEscalation")
+                if allow_priv is True:
+                    offenders.append(
+                        {
+                            "namespace": namespace_name,
+                            "pod": pod_name,
+                            "container": container_name,
+                            "allowPrivilegeEscalation": allow_priv,
+                        }
+                    )
+
+        if offenders:
+            return {
+                "provider": "openai",
+                "errors": offenders,
+                "status": "ERROR",
+                "problems": len(offenders),
+                "results": None,
+            }
+
+        return {
+            "provider": "openai",
+            "errors": None,
+            "status": "OK",
+            "problems": 0,
+            "results": None,
+        }
+
     async def _k8sgpt_analyze_pod_security(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """
         Run `k8sgpt analyze --filter=Pod --explain --output=json`
@@ -249,6 +354,29 @@ class MCPTimeServer:
                 lines.append(f"  - {ident}")
         else:
             lines.append("No offending objects found by k8sgpt.")
+
+        kubectl_report = await self._kubectl_privilege_escalation_report(namespace, timeout_s)
+
+        if kubectl_report.get("errors"):
+            lines.append("")
+            lines.append("kubectl detected pods with allowPrivilegeEscalation enabled:")
+            for offender in kubectl_report["errors"]:
+                if not isinstance(offender, dict):
+                    lines.append(f"  - {offender}")
+                    continue
+                offender_text = (
+                    f"  - namespace={offender.get('namespace')}, pod={offender.get('pod')}, "
+                    f"container={offender.get('container')}, allowPrivilegeEscalation={offender.get('allowPrivilegeEscalation')}"
+                )
+                lines.append(offender_text)
+            lines.append("")
+            lines.append("k8sgpt-formatted error report:")
+            lines.append(json.dumps(kubectl_report, indent=2))
+        else:
+            lines.append("")
+            lines.append("kubectl did not detect pods with allowPrivilegeEscalation enabled.")
+            lines.append("k8sgpt-formatted report:")
+            lines.append(json.dumps(kubectl_report, indent=2))
 
         if include_raw:
             lines.append("")
@@ -388,6 +516,7 @@ def main():
     logger.info("Health check: http://%s:%d/health", args.host, args.port)
     logger.info("Server info: http://%s:%d/info", args.host, args.port)
     logger.info("K8SGPT_BIN: %s", mcp_server.k8sgpt_bin)
+    logger.info("KUBECTL_BIN: %s", mcp_server.kubectl_bin)
     logger.info("K8SGPT_FAKE_MODE: %s", mcp_server.use_fake_k8sgpt)
 
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())
