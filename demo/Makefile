@@ -18,7 +18,7 @@ rag-agent:
 server: rag-agent
 
 client:
-\t$(PYTHON) -m src.client.client --query "$(QUESTION)"
+	$(PYTHON) -m src.client.client --query "$(QUESTION)"
 
 client-fake:
-\tK8SGPT_FAKE_MODE=1 $(PYTHON) -m src.client.client --query "$(QUESTION)"
+	K8SGPT_FAKE_MODE=1 $(PYTHON) -m src.client.client --query "$(QUESTION)"
