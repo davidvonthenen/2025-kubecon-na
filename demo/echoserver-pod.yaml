@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: echoserver
+  labels:
+    app: echoserver
+spec:
+  containers:
+    - name: echoserver
+      image: registry.k8s.io/e2e-test-images/echoserver:2.5
+      ports:
+        - containerPort: 8080

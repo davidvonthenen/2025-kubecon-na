@@ -1,0 +1,15 @@
+minikube start
+kubectl config use-context minikube
+
+kubectl apply -f echoserver-pod.yaml
+kubectl get pods
+
+
+
+
+kubectl port-forward pod/echoserver 8080:8080
+
+minikube delete
+
+k8sgpt auth add --backend openai --model gpt-5-nano --password <key>
+k8sgpt auth update --backend openai --model gpt-5-nano --password <key>
