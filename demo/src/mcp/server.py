@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional, List
 from dataclasses import dataclass
 from starlette.applications import Starlette
-from starlette.requests import Request
+from starlette.requests import Request, ClientDisconnect
 from starlette.responses import StreamingResponse, JSONResponse
 from starlette.routing import Route
 import uvicorn
@@ -455,19 +455,42 @@ mcp_server = MCPTimeServer()
 
 async def sse_endpoint(request: Request) -> StreamingResponse:
     """SSE endpoint for MCP protocol."""
+
     async def event_stream():
         try:
-            body = await request.body()
-            if body:
+            if request.method.upper() == "POST":
                 try:
-                    message = json.loads(body.decode('utf-8'))
-                    logger.info("Received message: %s", json.dumps(message, indent=2))
-                    response = await mcp_server.handle_message(message)
-                    yield f"data: {json.dumps(response)}\n\n"
-                except json.JSONDecodeError:
-                    error_response = {"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}
-                    yield f"data: {json.dumps(error_response)}\n\n"
-            await asyncio.sleep(0.1)
+                    body = await request.body()
+                except ClientDisconnect:
+                    logger.info("Client disconnected before sending POST body")
+                    return
+
+                if body:
+                    try:
+                        message = json.loads(body.decode("utf-8"))
+                    except json.JSONDecodeError:
+                        error_response = {
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32700, "message": "Parse error"},
+                        }
+                        yield f"data: {json.dumps(error_response)}\n\n"
+                    else:
+                        logger.info("Received message: %s", json.dumps(message, indent=2))
+                        response = await mcp_server.handle_message(message)
+                        yield f"data: {json.dumps(response)}\n\n"
+                else:
+                    logger.debug("POST /sse received with empty body")
+                return
+            else:
+                # GET requests open the SSE channel. Send a ready event so clients
+                # know the stream is established even before any tool invocations.
+                initial_payload = {"event": "ready", "server": mcp_server.server_info}
+                yield f"data: {json.dumps(initial_payload)}\n\n"
+                while True:
+                    await asyncio.sleep(15.0)
+                    yield ": keep-alive\n\n"
+        except ClientDisconnect:
+            logger.info("SSE client disconnected")
         except Exception as e:
             logger.error("Error in event stream: %s", e, exc_info=True)
 
